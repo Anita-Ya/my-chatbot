@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import os
@@ -7,13 +8,17 @@ import uuid
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
+from pypdf import PdfReader
 
 load_dotenv()
 client = Groq()
 
-MODEL = "openai/gpt-oss-20b"
+TEXT_MODEL = "openai/gpt-oss-20b"
+VISION_MODEL = "qwen/qwen3.8-27b"
+MAX_FILE_CHARS = 4000
+MAX_FILES_IN_MEMORY = 2
 SYSTEM = (
-    "You are a helpful assistant for <describe your use case>. "
+    "You are a helpful assistant for <for study>. "
     "Keep answers short and clear. If you don't know something, say so."
 )
 
@@ -36,6 +41,10 @@ def conn():
     c.execute(
         "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY "
         "AUTOINCREMENT, chat_id TEXT, role TEXT, content TEXT)"
+    )
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS chat_files (id INTEGER PRIMARY KEY "
+        "AUTOINCREMENT, chat_id TEXT, name TEXT, text TEXT)"
     )
     return c
 
@@ -100,6 +109,23 @@ def save_message(chat_id, role, content):
             (chat_id, role, content),
         )
 
+def save_file_text(chat_id, name, text):
+    with conn() as c:
+        c.execute(
+            "INSERT INTO chat_files (chat_id, name, text) VALUES (?, ?, ?)",
+            (chat_id, name, text),
+        )
+
+def load_file_texts(chat_id, user):
+    # newest files first; join on username so users only see their own
+    with conn() as c:
+        return c.execute(
+            "SELECT f.name, f.text FROM chat_files f "
+            "JOIN chats ch ON ch.chat_id = f.chat_id "
+            "WHERE f.chat_id=? AND ch.username=? ORDER BY f.id DESC LIMIT ?",
+            (chat_id, user, MAX_FILES_IN_MEMORY),
+        ).fetchall()
+
 # ---------- Login / Sign up screen ----------
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -162,21 +188,86 @@ for m in st.session_state.messages:
         st.markdown(m["content"])
 
 # ---------- Handle new message ----------
-if prompt := st.chat_input("Type your message..."):
+def build_content(text, files):
+    """Returns (content for Groq, has_image, file names, file texts)."""
+    images = []
+    names = []
+    file_texts = []
+    for f in files:
+        names.append(f.name)
+        if f.type.startswith("image/"):
+            b64 = base64.b64encode(f.getvalue()).decode()
+            images.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{f.type};base64,{b64}"},
+            })
+        elif f.type == "application/pdf":
+            reader = PdfReader(f)
+            doc = "\n".join(p.extract_text() or "" for p in reader.pages)
+            file_texts.append((f.name, doc[:MAX_FILE_CHARS]))
+        else:
+            doc = f.getvalue().decode("utf-8", errors="ignore")
+            file_texts.append((f.name, doc[:MAX_FILE_CHARS]))
+
+    full_text = text or "Please look at the attached file(s)."
+    if images:
+        content = [{"type": "text", "text": full_text}] + images
+    else:
+        content = full_text
+    return content, bool(images), names, file_texts
+
+
+prompt = st.chat_input(
+    "Type your message...",
+    accept_file="multiple",
+    file_type=["png", "jpg", "jpeg", "pdf", "txt", "csv"],
+)
+
+if prompt:
     chat_id = st.session_state.chat_id
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    user_text = prompt.text or ""
+    files = prompt.files
+
+    content, has_image, names, file_texts = build_content(user_text, files)
+    model = VISION_MODEL if has_image else TEXT_MODEL
+
+    # plain text version that gets shown and saved in chat.db
+    saved_text = user_text
+    if names:
+        saved_text += "\n\n📎 " + ", ".join(names)
+
+    st.session_state.messages.append({"role": "user", "content": saved_text})
     if len(st.session_state.messages) == 1:
-        create_chat(chat_id, user, prompt)  # first message becomes the title
-    save_message(chat_id, "user", prompt)
+        create_chat(chat_id, user, (user_text or names[0])[:50])  # first message = title
+    save_message(chat_id, "user", saved_text)
+
+    # remember uploaded file text for the rest of this chat
+    for name, text in file_texts:
+        save_file_text(chat_id, name, text)
+
+    system = SYSTEM
+    docs = load_file_texts(chat_id, user)
+    if docs:
+        system += "\n\nThe user uploaded these files in this chat. Use them to answer questions:"
+        for name, text in docs:
+            system += f"\n\n[File: {name}]\n{text}"
+
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(saved_text)
+        for f in files:
+            if f.type.startswith("image/"):
+                st.image(f, width=250)
+
+    keep = 4 if has_image else 10
+    history = st.session_state.messages[-keep:-1] + [
+        {"role": "user", "content": content}
+    ]
 
     with st.chat_message("assistant"):
         try:
             stream = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "system", "content": SYSTEM}]
-                + st.session_state.messages[-20:],
+                model=model,
+                messages=[{"role": "system", "content": system}] + history,
                 max_tokens=1000,
                 stream=True,
             )
